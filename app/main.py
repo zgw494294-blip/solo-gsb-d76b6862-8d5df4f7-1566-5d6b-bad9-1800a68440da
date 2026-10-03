@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .composite import MAX_IMAGE_BYTES, composite_preview, parse_payload_field
+from .picker import MAX_IMAGE_BYTES as MAX_PICKER_IMAGE_BYTES, pick_samples
 from .core import (
     CalibrationError,
     confirm_cycle_resolution,
@@ -188,6 +189,56 @@ async def api_composite_preview(request: Request) -> Response:
         "X-Composite-Height": str(height),
     }
     return Response(content=png, media_type="image/png", headers=headers)
+
+
+@app.post("/api/pick-samples")
+async def api_pick_samples(request: Request) -> JSONResponse:
+    """接收背景图、叠层实测图（multipart 字段 background / target）与零基整数
+    坐标（multipart 字段 payload，JSON 文本 points），直接读取对应像素的原始
+    RGB 并按提交顺序返回背景 / 目标 HEX。任何校验失败均为 400 JSON。"""
+    try:
+        try:
+            form = await request.form(max_part_size=MAX_PICKER_IMAGE_BYTES + 1)
+        except TypeError:
+            form = await request.form()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"errors": [{"scope": "form", "message": "请求必须是 multipart/form-data 表单（含 payload、background 与 target 字段），或图片体积超过 2 MiB 上限"}]},
+        )
+
+    bg_upload = form.get("background")
+    if bg_upload is None or not hasattr(bg_upload, "read"):
+        return JSONResponse(
+            status_code=400,
+            content={"errors": [{"scope": "image", "message": "缺少背景图文件：请通过 multipart 表单字段 background 上传一张 PNG 图片"}]},
+        )
+    tg_upload = form.get("target")
+    if tg_upload is None or not hasattr(tg_upload, "read"):
+        return JSONResponse(
+            status_code=400,
+            content={"errors": [{"scope": "image", "message": "缺少目标图文件：请通过 multipart 表单字段 target 上传一张 PNG 图片"}]},
+        )
+
+    # 各多读一个字节用于区分「正好 2 MiB」与「超过 2 MiB」，超限文件不全量读入内存
+    bg_data = await bg_upload.read(MAX_PICKER_IMAGE_BYTES + 1)
+    if len(bg_data) > MAX_PICKER_IMAGE_BYTES:
+        return JSONResponse(
+            status_code=400,
+            content={"errors": [{"scope": "image", "message": f"背景图体积超出 2 MiB（{MAX_PICKER_IMAGE_BYTES} 字节）上限，请压缩或裁剪后重试"}]},
+        )
+    tg_data = await tg_upload.read(MAX_PICKER_IMAGE_BYTES + 1)
+    if len(tg_data) > MAX_PICKER_IMAGE_BYTES:
+        return JSONResponse(
+            status_code=400,
+            content={"errors": [{"scope": "image", "message": f"目标图体积超出 2 MiB（{MAX_PICKER_IMAGE_BYTES} 字节）上限，请压缩或裁剪后重试"}]},
+        )
+
+    try:
+        result = pick_samples(form.get("payload"), bg_data, tg_data)
+    except CalibrationError as exc:
+        return JSONResponse(status_code=400, content={"errors": exc.errors})
+    return JSONResponse(status_code=200, content=result)
 
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"

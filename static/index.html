@@ -41,6 +41,55 @@
         <div id="samples" class="rows"></div>
       </div>
 
+      <!-- 从图片对应像素取点 -->
+      <div class="card picker-card" id="pickerCard">
+        <div class="card-head">
+          <h2>从图片像素取点追加样本 <span class="hint">（背景图与叠层实测图，各点 1～4 个）</span></h2>
+          <span id="pickerStatus" class="status"></span>
+        </div>
+        <div id="pickerBody">
+          <div class="infer-field">
+            <div class="infer-field-label">
+              背景图（PNG、RGB 模式、不超过 2 MiB、宽高各不超过 512 像素）
+            </div>
+            <input id="pickerBgFile" type="file" accept="image/png,.png" />
+            <span id="pickerBgHint" class="hint"></span>
+          </div>
+          <div class="infer-field">
+            <div class="infer-field-label">
+              叠层实测图（与背景图同尺寸、同限制；在背景图上点选，自动取两图同一像素）
+            </div>
+            <input id="pickerTgFile" type="file" accept="image/png,.png" />
+            <span id="pickerTgHint" class="hint"></span>
+          </div>
+          <div id="pickerStage" class="picker-stage" hidden>
+            <div class="picker-canvas-col">
+              <div class="picker-canvas-label">背景图（在图上点击取点，缩放不影响原图像素）</div>
+              <div class="picker-canvas-wrap" id="pickerBgWrap">
+                <img id="pickerBgImg" class="picker-img" alt="背景图" />
+                <div id="pickerMarkers" class="picker-markers"></div>
+              </div>
+            </div>
+            <div class="picker-canvas-col">
+              <div class="picker-canvas-label">叠层实测图（相同坐标同步标记，不可点击）</div>
+              <div class="picker-canvas-wrap" id="pickerTgWrap">
+                <img id="pickerTgImg" class="picker-img" alt="叠层实测图" />
+                <div id="pickerTgMarkers" class="picker-markers"></div>
+              </div>
+            </div>
+          </div>
+          <div class="infer-actions">
+            <button id="pickerClearBtn" class="btn btn-ghost btn-small" data-act="picker-clear"
+                    type="button" disabled>清空全部取点</button>
+            <button id="pickerRunBtn" class="btn btn-small" data-act="picker-run"
+                    type="button" disabled>提取颜色对</button>
+            <span id="pickerHint" class="hint">请先选择两张同尺寸 RGB PNG</span>
+          </div>
+          <div id="pickerErrors" class="infer-errors" hidden></div>
+          <div id="pickerResult"></div>
+        </div>
+      </div>
+
       <!-- 先后关系 -->
       <div class="card">
         <div class="card-head">

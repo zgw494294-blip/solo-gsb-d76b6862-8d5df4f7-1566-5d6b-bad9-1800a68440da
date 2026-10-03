@@ -40,6 +40,15 @@ function noteSolveInputChanged() {
   // 资格与在途合成资格，无需等待任何在途求解 / 合成完成。
   compositeState.epoch += 1;
   markCompositeStaleness(); // 图层 / 样本 / 关系变化也立即撤销旧合成预览的下载资格
+  // 像素取点颜色对只依赖图片、取点与样本：仅当样本发生变化时作废旧颜色对与在途
+  // 取点请求（图层 / 关系变化不改变像素，不影响取点结果）；纪元只增不减，改回原
+  // 值也不能让旧颜色对重新获得追加资格。
+  const samplesSig = JSON.stringify(state.samples);
+  if (samplesSig !== pickerSamplesSig) {
+    pickerSamplesSig = samplesSig;
+    pickerState.epoch += 1;
+  }
+  markPickerStaleness();
 }
 
 const $ = (sel) => document.querySelector(sel);
@@ -2783,8 +2792,483 @@ window.addEventListener("beforeunload", () => {
   revokeCompositeResultUrls();
 });
 
+// ============================================================ 图片像素取点追加样本 ==
+//
+// 从背景图与叠层实测图的对应像素提取校准样本：
+//  - 两张同尺寸 RGB PNG（各 ≤2 MiB、宽高均 ≤512）；只在背景图上点选 1～4 个互异
+//    位置，浏览器按「点击位置 / 显示尺寸 × 原图像素」映射回原图像素，缩放显示不
+//    影响坐标；提交后服务端直接读取两图同一像素的原始 RGB 返回 HEX，不插值、不合成。
+//  - 先展示颜色对，确认后整批追加到现有样本：同批只能追加一次；追加后总数超过
+//    4 组则整批拒绝（已有样本不变）。
+//  - 换图（含清空）立即清空取点与候选颜色对；取点或样本变化后，旧颜色对与在途
+//    提取结果一律不能再用于追加。纪元只增不减，改回原值也不复活。
+const pickerState = {
+  bgFile: null,           // 选中的背景图 File
+  tgFile: null,           // 选中的目标图 File
+  bgDim: null,            // 背景图 {width, height}（客户端解码）
+  tgDim: null,            // 目标图 {width, height}
+  bgUrl: null,            // 背景图展示用 ObjectURL（换图 / 关闭页面时回收）
+  tgUrl: null,            // 目标图展示用 ObjectURL
+  points: [],             // 已点选的原图像素坐标 [{x, y}]
+  epoch: 0,               // 图片 / 取点 / 样本纪元（只增不减）
+  result: null,           // 最近一次成功提取的颜色对
+  resultEpoch: 0,         // 结果产生时的纪元
+  appended: false,        // 当前结果是否已整批追加过一次（同批只能追加一次）
+  inflightId: 0,          // 当前仍可落地的在途请求序号；0 表示无
+  inflightEpoch: 0,       // 在途请求发出时的纪元
+  reqSeq: 0,              // 单调递增请求序号源，永不归零
+};
+
+// 上次已知的样本指纹：样本（含其他流程 / 外部追加）一旦变化，像素取点的颜色对
+// 即按新样本计数判定能否追加；由 noteSolveInputChanged 在变化时推进取点纪元。
+let pickerSamplesSig = JSON.stringify(state.samples);
+
+const elPickerStatus = $("#pickerStatus");
+const elPickerBgFile = $("#pickerBgFile");
+const elPickerTgFile = $("#pickerTgFile");
+const elPickerBgHint = $("#pickerBgHint");
+const elPickerTgHint = $("#pickerTgHint");
+const elPickerStage = $("#pickerStage");
+const elPickerBgImg = $("#pickerBgImg");
+const elPickerTgImg = $("#pickerTgImg");
+const elPickerBgMarkers = $("#pickerMarkers");
+const elPickerTgMarkers = $("#pickerTgMarkers");
+const elPickerRunBtn = $("#pickerRunBtn");
+const elPickerClearBtn = $("#pickerClearBtn");
+const elPickerHint = $("#pickerHint");
+const elPickerErrors = $("#pickerErrors");
+const elPickerResult = $("#pickerResult");
+
+function pickerBothReady() {
+  return !!(pickerState.bgFile && pickerState.tgFile &&
+    pickerState.bgDim && pickerState.tgDim &&
+    pickerState.bgDim.width === pickerState.tgDim.width &&
+    pickerState.bgDim.height === pickerState.tgDim.height);
+}
+
+// 换图（含清空选择）在选择的第一时间（先于解码）：纪元 +1、清空取点与颜色对、
+// 撤销在途提取资格，再按本次选择重新解码；解码期间再换图 / 改样本会让旧解码整体作废。
+function handlePickerFileChange(kind) {
+  const input = kind === "bg" ? elPickerBgFile : elPickerTgFile;
+  const file = input.files && input.files[0] ? input.files[0] : null;
+  const selectEpoch = pickerState.epoch + 1;
+  pickerState.epoch = selectEpoch;
+  pickerState.points = [];
+  pickerState.result = null;
+  pickerState.resultEpoch = 0;
+  pickerState.appended = false;
+  if (pickerState.bgUrl) { URL.revokeObjectURL(pickerState.bgUrl); pickerState.bgUrl = null; }
+  if (pickerState.tgUrl) { URL.revokeObjectURL(pickerState.tgUrl); pickerState.tgUrl = null; }
+  elPickerResult.innerHTML = "";
+  showPickerErrors([]);
+  if (kind === "bg") {
+    pickerState.bgFile = null;
+    pickerState.bgDim = null;
+    elPickerBgHint.textContent = "";
+  } else {
+    pickerState.tgFile = null;
+    pickerState.tgDim = null;
+    elPickerTgHint.textContent = "";
+  }
+  markPickerStaleness();
+  return finalizePickerFile(kind, file, selectEpoch);
+}
+
+async function finalizePickerFile(kind, file, selectEpoch) {
+  const hint = kind === "bg" ? elPickerBgHint : elPickerTgHint;
+  const label = kind === "bg" ? "背景图" : "目标图";
+  if (!file) {
+    refreshPickerStage();
+    return;
+  }
+  // 客户端预检：扩展名 / MIME、体积；再浏览器解码确认可解码与尺寸
+  // （PNG 必须是 RGB 模式由服务端严格判定，浏览器无法可靠区分 RGB / RGBA）。
+  const errs = [];
+  const nameOk = /\.png$/i.test(file.name) || file.type === "image/png";
+  if (!nameOk) errs.push(`${label}必须是 PNG 格式（不接受 JPEG / GIF / WebP 等）`);
+  if (file.size > 2 * 1024 * 1024) {
+    errs.push(`${label}体积 ${file.size} 字节超出 2 MiB（2097152 字节）上限`);
+  }
+  let dims = null;
+  if (nameOk && file.size <= 2 * 1024 * 1024) {
+    try {
+      dims = await probeImage(file);
+    } catch (msg) {
+      errs.push(`${label}${msg}`);
+    }
+  }
+  if (dims && (dims.width > 512 || dims.height > 512)) {
+    errs.push(`${label}尺寸 ${dims.width}×${dims.height} 超出上限：宽、高均不得超过 512 像素（不会缩放）`);
+    dims = null;
+  }
+  // 解码期间又换图 / 改样本：本次选择整体作废，不覆盖较新状态
+  if (pickerState.epoch !== selectEpoch) return;
+  if (errs.length) {
+    showPickerErrors(errs.map((m) => ({ scope: "image", message: m })));
+    if (kind === "bg") { pickerState.bgFile = null; pickerState.bgDim = null; }
+    else { pickerState.tgFile = null; pickerState.tgDim = null; }
+    refreshPickerStage();
+    return;
+  }
+  if (kind === "bg") { pickerState.bgFile = file; pickerState.bgDim = dims; }
+  else { pickerState.tgFile = file; pickerState.tgDim = dims; }
+  hint.textContent = `${file.name} · ${dims.width}×${dims.height} · ${file.size} 字节`;
+  refreshPickerStage();
+}
+
+// 两图都就绪且尺寸一致时显示取点画布；尺寸不一致保留文件登记但不给取点
+function refreshPickerStage() {
+  const ready = pickerBothReady();
+  const bothHaveDims = pickerState.bgDim && pickerState.tgDim;
+
+  if (pickerState.bgFile && pickerState.tgFile && bothHaveDims && !ready) {
+    showPickerErrors([
+      {
+        scope: "image",
+        message: `两张图片尺寸不符：背景图为 ${pickerState.bgDim.width}×${pickerState.bgDim.height}，` +
+          `目标图为 ${pickerState.tgDim.width}×${pickerState.tgDim.height}，请重新选择两张同尺寸 PNG`,
+      },
+    ]);
+  }
+
+  elPickerStage.hidden = !ready;
+  if (ready) {
+    showPickerErrors([]);
+    // 仅在尚未登记展示 URL（首次就绪 / 换图后）时创建，避免重复 refresh 造成闪烁
+    if (!pickerState.bgUrl) {
+      pickerState.bgUrl = URL.createObjectURL(pickerState.bgFile);
+      elPickerBgImg.src = pickerState.bgUrl;
+    }
+    if (!pickerState.tgUrl) {
+      pickerState.tgUrl = URL.createObjectURL(pickerState.tgFile);
+      elPickerTgImg.src = pickerState.tgUrl;
+    }
+  }
+  renderPickerMarkers();
+  updatePickerControls();
+}
+
+// 点击背景图：按显示尺寸比例映射到原图像素（缩放显示仍取原图像素）
+function pickerCanvasToImage(ev) {
+  const rect = elPickerBgImg.getBoundingClientRect();
+  const { width, height } = pickerState.bgDim;
+  const x = Math.min(width - 1, Math.max(0, Math.floor(((ev.clientX - rect.left) / rect.width) * width)));
+  const y = Math.min(height - 1, Math.max(0, Math.floor(((ev.clientY - rect.top) / rect.height) * height)));
+  return { x, y };
+}
+
+function renderPickerMarkers() {
+  const draw = (container, interactive) => {
+    container.innerHTML = "";
+    pickerState.points.forEach((p, k) => {
+      // 背景图标号可点击移除；目标图只同步显示相同坐标标号，不可点击
+      const mk = document.createElement(interactive ? "button" : "span");
+      if (interactive) mk.type = "button";
+      mk.className = interactive ? "picker-marker" : "picker-marker picker-marker-readonly";
+      mk.title = interactive
+        ? `第 ${k + 1} 点 (${p.x}, ${p.y})；点击移除`
+        : `第 ${k + 1} 点 (${p.x}, ${p.y})（与背景图相同坐标）`;
+      mk.textContent = String(k + 1);
+      mk.style.left = `${(p.x / pickerState.bgDim.width) * 100}%`;
+      mk.style.top = `${(p.y / pickerState.bgDim.height) * 100}%`;
+      if (interactive) {
+        mk.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          removePickerPoint(k);
+        });
+      }
+      container.appendChild(mk);
+    });
+  };
+  if (pickerBothReady()) {
+    draw(elPickerBgMarkers, true);
+    draw(elPickerTgMarkers, false);
+  } else {
+    elPickerBgMarkers.innerHTML = "";
+    elPickerTgMarkers.innerHTML = "";
+  }
+}
+
+function addPickerPoint(ev) {
+  if (!pickerBothReady()) return;
+  const { x, y } = pickerCanvasToImage(ev);
+  if (pickerState.points.some((p) => p.x === x && p.y === y)) return; // 互异位置，重复忽略
+  if (pickerState.points.length >= 4) return;
+  pickerState.points.push({ x, y });
+  // 取点变化：旧颜色对与在途结果立即失效，纪元 +1（只增不减）
+  pickerState.epoch += 1;
+  markPickerStaleness();
+  renderPickerMarkers();
+  updatePickerControls();
+}
+
+function removePickerPoint(k) {
+  pickerState.points.splice(k, 1);
+  pickerState.epoch += 1;
+  markPickerStaleness();
+  renderPickerMarkers();
+  updatePickerControls();
+}
+
+function clearPickerPoints() {
+  if (!pickerState.points.length) return;
+  pickerState.points = [];
+  pickerState.epoch += 1;
+  markPickerStaleness();
+  renderPickerMarkers();
+  updatePickerControls();
+}
+
+function updatePickerControls() {
+  const ready = pickerBothReady();
+  const n = pickerState.points.length;
+  elPickerClearBtn.disabled = n === 0;
+  elPickerRunBtn.disabled = !(ready && n >= 1 && n <= 4 && pickerState.inflightId === 0);
+  if (!pickerState.bgFile || !pickerState.tgFile) {
+    elPickerHint.textContent = "请先选择背景图与叠层实测图两张同尺寸 RGB PNG";
+  } else if (!ready) {
+    elPickerHint.textContent = "两张图片尺寸不一致或尚未通过预检，不能取点";
+  } else if (n === 0) {
+    elPickerHint.textContent = `在背景图上点选 1～4 个互异位置（当前图片 ${pickerState.bgDim.width}×${pickerState.bgDim.height}，缩放显示仍映射原图像素）`;
+  } else if (n >= 4) {
+    elPickerHint.textContent = "已选 4 个位置（上限）；点击标号可移除";
+  } else if (pickerState.inflightId !== 0) {
+    elPickerHint.textContent = "正在提取颜色对…";
+  } else {
+    elPickerHint.textContent = `已选 ${n} 个位置，点击标号可移除，或直接提取颜色对`;
+  }
+}
+
+// 取点 / 换图 / 样本变化时：刷新按钮状态并把已展示颜色对标记为不可追加。
+// 不在这里摘除在途请求身份——markPickerStaleness 会被自动求解 / 渲染等无关流程
+// （如仅图层变化、求解返回后的 render）反复调用；在途请求是否可落地完全由
+// pickerResponseCurrent 的纪元守卫在响应头与响应体读完后两次判定，过期响应（成功 /
+// HTTP 错误 / 连接异常 / 解析失败）一律丢弃，加载态随该响应返回时自然结束。
+function markPickerStaleness() {
+  updatePickerControls();
+  renderPickerResultIfAny();
+}
+
+function pickerResultFresh() {
+  return !!pickerState.result && pickerState.resultEpoch === pickerState.epoch && !pickerState.appended;
+}
+
+function pickerResponseCurrent(reqId, reqEpoch) {
+  return (
+    pickerState.inflightId === reqId &&
+    pickerState.inflightEpoch === reqEpoch &&
+    pickerState.epoch === reqEpoch
+  );
+}
+
+async function runPickSamples() {
+  if (!pickerBothReady()) return;
+  const n = pickerState.points.length;
+  if (n < 1 || n > 4 || pickerState.inflightId !== 0) return;
+  // 追加后超过 4 组则整批拒绝：直接不发请求，已有样本不变
+  if (state.samples.length + n > MAX_SAMPLES) {
+    showPickerErrors([
+      {
+        scope: "points",
+        message: `当前已有 ${state.samples.length} 组样本，整批追加 ${n} 组后将达到 ` +
+          `${state.samples.length + n} 组，超过 ${MAX_SAMPLES} 组上限：整批拒绝，未改动样本；` +
+          "请减少取点数量，或先在上方样本区删除部分样本",
+      },
+    ]);
+    return;
+  }
+
+  const reqId = ++pickerState.reqSeq;
+  const reqEpoch = pickerState.epoch;
+  pickerState.inflightId = reqId;
+  pickerState.inflightEpoch = reqEpoch;
+  elPickerStatus.textContent = "提取颜色对中…";
+  elPickerStatus.className = "status busy";
+  // 新一次有效提取开始即清掉此前错误（如整批超限提示）：本次成功 / 失败会再给出新结论
+  showPickerErrors([]);
+  updatePickerControls();
+
+  const fd = new FormData();
+  fd.append("payload", JSON.stringify({ points: pickerState.points.map((p) => ({ x: p.x, y: p.y })) }));
+  fd.append("background", pickerState.bgFile);
+  fd.append("target", pickerState.tgFile);
+
+  try {
+    const resp = await fetch("/api/pick-samples", { method: "POST", body: fd });
+    if (!pickerResponseCurrent(reqId, reqEpoch)) return; // 上传期间已换图 / 改取点 / 改样本
+    const data = await resp.json(); // 响应体读取窗口：读完后再过一次守卫
+    if (!pickerResponseCurrent(reqId, reqEpoch)) return;
+    pickerState.inflightId = 0;
+    pickerState.inflightEpoch = 0;
+    elPickerStatus.textContent = "";
+    elPickerStatus.className = "status";
+    if (!resp.ok) {
+      showPickerErrors(data.errors || [{ scope: "form", message: "颜色对提取失败" }]);
+      updatePickerControls();
+      return;
+    }
+    showPickerErrors([]);
+    pickerState.result = data;
+    pickerState.resultEpoch = reqEpoch;
+    pickerState.appended = false;
+    renderPickerResultIfAny();
+    updatePickerControls();
+  } catch (err) {
+    if (!pickerResponseCurrent(reqId, reqEpoch)) return;
+    pickerState.inflightId = 0;
+    pickerState.inflightEpoch = 0;
+    elPickerStatus.textContent = "";
+    elPickerStatus.className = "status";
+    showPickerErrors([{ scope: "form", message: "无法连接取点服务：" + err.message }]);
+    updatePickerControls();
+  }
+}
+
+function showPickerErrors(errors) {
+  if (!errors || !errors.length) {
+    elPickerErrors.hidden = true;
+    elPickerErrors.innerHTML = "";
+    return;
+  }
+  elPickerErrors.innerHTML =
+    "<ul>" + errors.map((er) => `<li>${escapeHtml(er.message)}</li>`).join("") + "</ul>";
+  elPickerErrors.hidden = false;
+}
+
+function renderPickerResultIfAny() {
+  const r = pickerState.result;
+  if (!r) {
+    elPickerResult.innerHTML = "";
+    return;
+  }
+  const fresh = pickerState.resultEpoch === pickerState.epoch;
+  const appended = pickerState.appended;
+  const totalAfter = state.samples.length + r.pointCount;
+  const wouldOverflow = totalAfter > MAX_SAMPLES;
+
+  const staleNote = !fresh
+    ? '<div class="stale-note">图片、取点或样本已变化，以下颜色对已失效（即使改回原值也不能再追加），请重新取点提取。</div>'
+    : appended
+      ? '<div class="stale-note">本批颜色对已追加过一次（同批仅能追加一次）；需要新样本请重新取点提取。</div>'
+      : "";
+
+  const rows = r.pairs
+    .map((p) => `
+      <div class="picker-pair-row">
+        <span class="row-index">${p.index + 1}</span>
+        <span class="hint">(${p.x}, ${p.y})</span>
+        <span class="swatch-box">
+          <span class="swatch-big" style="background:${p.backgroundHex}"></span>
+          <span class="swatch-meta">
+            <div class="name">背景</div>
+            <div class="hexval">${p.backgroundHex}</div>
+            <div class="name">rgb(${p.backgroundRgb.join(", ")})</div>
+          </span>
+        </span>
+        <div class="compare-arrow">→</div>
+        <span class="swatch-box">
+          <span class="swatch-big" style="background:${p.targetHex}"></span>
+          <span class="swatch-meta">
+            <div class="name">目标</div>
+            <div class="hexval">${p.targetHex}</div>
+            <div class="name">rgb(${p.targetRgb.join(", ")})</div>
+          </span>
+        </span>
+      </div>`)
+    .join("");
+
+  let appendArea;
+  if (appended) {
+    appendArea = `
+      <div class="hint picker-append-row">
+        本批 ${r.pointCount} 组颜色对已追加为样本并重新求解；同批只能追加一次，
+        请重新取点后再提取新的颜色对。
+      </div>`;
+  } else if (!fresh) {
+    appendArea = `
+      <div class="hint picker-append-row">颜色对已失效，不能追加；请按当前图片与取点重新提取。</div>`;
+  } else if (wouldOverflow) {
+    appendArea = `
+      <div class="hint picker-append-row">
+        当前已有 ${state.samples.length} 组样本，整批追加 ${r.pointCount} 组后为 ${totalAfter} 组，
+        超过 ${MAX_SAMPLES} 组上限：整批拒绝、不改动样本；请减少取点或先删除部分样本后重新提取。
+      </div>`;
+  } else {
+    appendArea = `
+      <div class="infer-apply-row">
+        <button class="btn btn-small" data-act="picker-append" type="button">
+          把本批 ${r.pointCount} 组颜色对追加为第 ${state.samples.length + 1}～${totalAfter} 组样本并重新求解
+        </button>
+        <span class="hint">整批一次性追加；成功后同批不能再次追加，旧取点结果失效</span>
+      </div>`;
+  }
+
+  elPickerResult.innerHTML = `
+    ${staleNote}
+    <div class="metric-row">
+      <span>图片尺寸：<b>${r.width}×${r.height}</b></span>
+      <span>取点：<b>${r.pointCount}</b> 个（直接读取原始像素 RGB，不插值 / 不合成）</span>
+      <span>当前样本：<b>${state.samples.length}</b> 组</span>
+    </div>
+    <div class="rows picker-pairs">${rows}</div>
+    ${appendArea}
+  `;
+}
+
+function appendPickerSamples() {
+  const r = pickerState.result;
+  // 再次核对资格：颜色对必须仍是最新取点 / 图片 / 样本的结果，且同批未追加过
+  if (!r || !pickerResultFresh()) return;
+  const n = r.pointCount;
+  if (state.samples.length + n > MAX_SAMPLES) return; // 超过 4 组整批拒绝
+  // 整批追加到现有样本（按提交顺序）
+  r.pairs.forEach((p) => {
+    state.samples.push({ background: p.backgroundHex, target: p.targetHex });
+  });
+  // 同批仅能追加一次
+  pickerState.appended = true;
+  render();
+  // 样本变化会经 noteSolveInputChanged 推进取点纪元（只增不减）：旧自动求解、反推
+  // 建议、背景建议 / 复核与调序执行立即失效，已确认的执行记录保留展示、输入不回滚；
+  // 随后以新样本重新求解。
+  noteSolveInputChanged();
+  markCycleStaleness();
+  markInferStaleness();
+  markSuggestStaleness();
+  renderSuggestControls();
+  markReviewStaleness();
+  markTransitionStaleness();
+  renderPickerResultIfAny();
+  updatePickerControls();
+  runSolve();
+}
+
+function initPicker() {
+  elPickerBgFile.addEventListener("change", () => handlePickerFileChange("bg"));
+  elPickerTgFile.addEventListener("change", () => handlePickerFileChange("tg"));
+  // 点击标号（移除取点）的事件已 stopPropagation，不会冒泡成新取点
+  $("#pickerBgWrap").addEventListener("click", (ev) => {
+    if (ev.target.closest && ev.target.closest(".picker-marker")) return;
+    addPickerPoint(ev);
+  });
+  document.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-act]");
+    if (!btn) return;
+    if (btn.dataset.act === "picker-run") void runPickSamples();
+    if (btn.dataset.act === "picker-clear") clearPickerPoints();
+    if (btn.dataset.act === "picker-append") appendPickerSamples();
+  });
+  updatePickerControls();
+}
+
+window.addEventListener("beforeunload", () => {
+  if (pickerState.bgUrl) URL.revokeObjectURL(pickerState.bgUrl);
+  if (pickerState.tgUrl) URL.revokeObjectURL(pickerState.tgUrl);
+});
+
 // ------------------------------------------------------------ 启动 --
 render();
 renderSuggestControls();
 renderReviewBgOptions();
+initPicker();
 runSolve();

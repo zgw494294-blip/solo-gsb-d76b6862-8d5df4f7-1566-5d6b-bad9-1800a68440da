@@ -921,3 +921,73 @@ a.btn.composite-download.is-disabled {
 }
 .diag-sample-row .hint b { color: var(--ink); font-weight: 600; }
 .diag-sample-tag { color: var(--ink-soft); }
+
+/* ------------------------- 图片像素取点 ------------------------- */
+.picker-stage {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 10px 0 4px;
+}
+.picker-canvas-col { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.picker-canvas-label { font-size: 12px; color: var(--ink-soft); }
+.picker-canvas-wrap {
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background:
+    repeating-conic-gradient(#eef0f4 0% 25%, #fafbfd 0% 50%) 0 0 / 16px 16px;
+}
+.picker-img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+#pickerBgImg { cursor: crosshair; }
+.picker-markers {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.picker-marker {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  box-shadow: 0 0 0 1px rgba(20, 26, 45, 0.35);
+  pointer-events: auto;
+  cursor: pointer;
+}
+.picker-marker:hover { background: var(--danger); }
+.picker-marker-readonly {
+  pointer-events: none;
+  background: var(--ink-soft);
+  cursor: default;
+}
+.picker-pair-row {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #fbfcfe;
+  flex-wrap: wrap;
+}
+.picker-pairs { margin-top: 10px; }
+.picker-append-row { margin-top: 12px; }
+@media (max-width: 640px) {
+  .picker-stage { grid-template-columns: 1fr; }
+}
