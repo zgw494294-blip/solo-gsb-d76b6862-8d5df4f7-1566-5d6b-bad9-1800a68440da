@@ -77,6 +77,49 @@
         </div>
       </div>
 
+      <!-- 图片取点提取样本 -->
+      <div class="card extract-card" id="extractCard">
+        <div class="card-head">
+          <h2>图片取点提取样本 <span class="hint">（背景图与叠层实测图对应像素 → 背景 / 目标颜色对）</span></h2>
+          <span id="extractStatus" class="status"></span>
+        </div>
+        <div id="extractBody">
+          <div class="infer-field">
+            <div class="infer-field-label">
+              背景图（PNG、RGB 模式、不超过 2 MiB、宽高各不超过 512 像素）
+            </div>
+            <input id="extractBgFile" type="file" accept="image/png,.png" />
+            <span id="extractBgHint" class="hint"></span>
+          </div>
+          <div class="infer-field">
+            <div class="infer-field-label">
+              叠层实测图（与背景图同尺寸的 RGB PNG，即叠层后的实拍 / 实测结果）
+            </div>
+            <input id="extractMeFile" type="file" accept="image/png,.png" />
+            <span id="extractMeHint" class="hint"></span>
+          </div>
+          <div class="infer-field">
+            <div class="infer-field-label">
+              在背景图上点选 1～4 个互异位置（缩放显示仍映射到原图像素；再次点击已选位置可取消）
+              <button id="extractClearBtn" class="btn btn-ghost btn-small"
+                      data-act="extract-clear" type="button">清空取点</button>
+            </div>
+            <div id="extractPickArea" class="extract-pick-area" hidden>
+              <img id="extractBgImg" class="extract-pick-img" alt="背景图取点区" />
+              <div id="extractMarkers"></div>
+            </div>
+            <div id="extractPoints" class="hint extract-points-line"></div>
+          </div>
+          <div class="infer-actions">
+            <button id="extractRunBtn" class="btn btn-small" data-act="extract-run"
+                    type="button" disabled>提取颜色对</button>
+            <span id="extractHint" class="hint">请先选择背景图与叠层实测图</span>
+          </div>
+          <div id="extractErrors" class="infer-errors" hidden></div>
+          <div id="extractResult"></div>
+        </div>
+      </div>
+
       <div class="card result-card">
         <div class="card-head">
           <h2>校准结果</h2>

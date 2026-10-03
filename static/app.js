@@ -79,6 +79,7 @@ function scheduleSolve(delay = 200) {
   markReviewStaleness();
   markTransitionStaleness();
   markCycleStaleness();
+  markExtractStaleness();
 }
 
 // ------------------------------------------------------------ 渲染输入 --
@@ -2159,6 +2160,7 @@ function appendReviewSample() {
   renderSuggestControls();
   markReviewStaleness();
   markTransitionStaleness();
+  markExtractStaleness();
   runSolve();
 }
 
@@ -2531,6 +2533,14 @@ document.addEventListener("click", (e) => {
   if (btn && btn.dataset.act === "composite-run") void runComposite();
 });
 
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-act]");
+  if (!btn) return;
+  if (btn.dataset.act === "extract-run") void runExtract();
+  if (btn.dataset.act === "extract-append") appendExtractedSamples();
+  if (btn.dataset.act === "extract-clear") clearExtractPoints();
+});
+
 elCompositeFile.addEventListener("change", () => {
   const file = elCompositeFile.files && elCompositeFile.files[0] ? elCompositeFile.files[0] : null;
   void selectCompositeFile(file);
@@ -2781,10 +2791,450 @@ function renderCompositeResultIfAny() {
 
 window.addEventListener("beforeunload", () => {
   revokeCompositeResultUrls();
+  if (extractState.bgUrl) URL.revokeObjectURL(extractState.bgUrl);
 });
+
+// ======================================================== 图片取点提取样本 ==
+//
+// 从背景图与叠层实测图的对应像素提取「背景 / 目标」颜色对，确认后整批追加为样本。
+//
+// 失效与请求竞态规则（与复核 / 合成同样严格）：
+//  - 换图（含清空选择）立即清空取点和候选：纪元 +1（只增不减），在途提取作废；
+//    取点每次变化同样让纪元 +1——旧候选与在途结果都不能再用于追加，即使改回
+//    原值也不恢复（纪元不回落）。
+//  - 候选 / 在途请求的指纹 = 纪元 + 当前样本列表：样本一经变化（左侧编辑、
+//    复核追加、本功能追加），旧候选与在途提取结果一律不能用于追加。
+//  - 同批候选仅能追加一次：成功追加即清空候选；追加后超过 4 组上限的批次
+//    整批拒绝，样本不被改动。
+//  - 请求序号取自永不归零的单调计数器；过期响应无论成功、HTTP 错误、连接异常
+//    还是解析失败都被直接丢弃，不改动候选、错误提示或较新请求的加载状态。
+const MAX_PICK_POINTS = 4;
+
+const extractState = {
+  bgFile: null,        // 当前背景图 File（未重新选择即不变）
+  bgDims: null,        // 背景图 {width, height}
+  bgUrl: "",           // 背景图展示用 objectURL
+  meFile: null,        // 当前叠层实测图 File
+  meDims: null,        // 实测图 {width, height}
+  bgError: "",         // 背景图客户端预检错误（空串表示无）
+  meError: "",         // 实测图客户端预检错误
+  serverErrors: [],    // 最近一次提取请求返回的服务端错误
+  points: [],          // 取点 [{x, y}]（原图零基坐标，左上角原点，提交顺序）
+  epoch: 0,            // 图片或取点每次变化 +1（只增不减）
+  selectSeq: { bg: 0, me: 0 }, // 每个文件槽各自的选择序号（解码竞态守卫）
+  result: null,        // 最近一次成功提取 {width, height, pairs}
+  resultKey: "",       // 结果产生时的指纹（纪元 + 样本）
+  lastAppendNote: "",  // 成功追加后的提示（候选已清空时展示）
+  inflightId: 0,       // 当前仍可落地的在途请求序号；0 表示无
+  inflightSig: "",     // 在途请求发出时的指纹
+  reqSeq: 0,           // 单调递增请求序号源，永不归零
+};
+
+const elExtractBgFile = $("#extractBgFile");
+const elExtractMeFile = $("#extractMeFile");
+const elExtractBgHint = $("#extractBgHint");
+const elExtractMeHint = $("#extractMeHint");
+const elExtractPickArea = $("#extractPickArea");
+const elExtractBgImg = $("#extractBgImg");
+const elExtractMarkers = $("#extractMarkers");
+const elExtractPoints = $("#extractPoints");
+const elExtractRunBtn = $("#extractRunBtn");
+const elExtractHint = $("#extractHint");
+const elExtractErrors = $("#extractErrors");
+const elExtractResult = $("#extractResult");
+const elExtractStatus = $("#extractStatus");
+
+// 候选 / 在途请求的指纹：图片与取点由纪元覆盖，样本列表直接计入——
+// 取点或样本任一变化后，旧候选与在途结果都不能再用于追加。
+function extractSignature() {
+  return JSON.stringify({
+    epoch: extractState.epoch,
+    samples: state.samples.map((s) => [String(s.background), String(s.target)]),
+  });
+}
+
+// 候选是否仍对应当前图片 / 取点 / 样本；false 时「确认追加」不可点击
+function extractResultFresh() {
+  return !!extractState.result && extractSignature() === extractState.resultKey;
+}
+
+// 两图均已通过客户端预检且尺寸一致（RGB 模式由服务端最终判定）
+function extractImagesReady() {
+  const b = extractState.bgDims;
+  const m = extractState.meDims;
+  return !!(
+    extractState.bgFile && extractState.meFile && b && m &&
+    b.width === m.width && b.height === m.height &&
+    !extractState.bgError && !extractState.meError
+  );
+}
+
+function refreshExtractErrors() {
+  const errs = [];
+  if (extractState.bgError) errs.push({ scope: "background", message: extractState.bgError });
+  if (extractState.meError) errs.push({ scope: "measured", message: extractState.meError });
+  const b = extractState.bgDims;
+  const m = extractState.meDims;
+  if (b && m && (b.width !== m.width || b.height !== m.height)) {
+    errs.push({
+      scope: "measured",
+      message: `两张图片尺寸不一致：背景图 ${b.width}×${b.height}，实测图 ${m.width}×${m.height}，请使用同尺寸的两张图`,
+    });
+  }
+  errs.push(...extractState.serverErrors);
+  if (!errs.length) {
+    elExtractErrors.hidden = true;
+    elExtractErrors.innerHTML = "";
+    return;
+  }
+  elExtractErrors.innerHTML =
+    "<ul>" + errs.map((er) => `<li>${escapeHtml(er.message)}</li>`).join("") + "</ul>";
+  elExtractErrors.hidden = false;
+}
+
+function updateExtractRunBtn() {
+  const n = extractState.points.length;
+  const busy = extractState.inflightId !== 0;
+  const ready = extractImagesReady();
+  elExtractRunBtn.disabled = busy || !ready || n < 1 || n > MAX_PICK_POINTS;
+  let hint;
+  if (!extractState.bgFile || !extractState.meFile) {
+    hint = "请先选择背景图与叠层实测图（同尺寸 RGB PNG）";
+  } else if (!ready) {
+    hint = "两张图片须均可解码且尺寸一致（详见上方错误提示）";
+  } else if (n < 1) {
+    hint = "在背景图上点击 1～4 个互异位置后再提取";
+  } else if (busy) {
+    hint = "正在提取…";
+  } else {
+    hint = `将按 ${n} 个取点逐像素读取两图原始 RGB（不插值、不合成）`;
+  }
+  elExtractHint.textContent = hint;
+}
+
+// 输入（图层 / 样本 / 关系）变化时由 scheduleSolve 调用；样本变化会使指纹失配，
+// 在途提取立即作废、旧候选标记失效（不能再追加）。图层 / 关系变化不影响指纹。
+function markExtractStaleness() {
+  if (extractState.inflightId !== 0 && extractSignature() !== extractState.inflightSig) {
+    extractState.inflightId = 0;
+    extractState.inflightSig = "";
+    elExtractStatus.textContent = "";
+    elExtractStatus.className = "status";
+  }
+  updateExtractRunBtn();
+  renderExtractResult();
+}
+
+function renderExtractPoints() {
+  const dims = extractState.bgDims;
+  const show = !!dims && !!extractState.bgUrl;
+  elExtractPickArea.hidden = !show;
+  if (show && elExtractBgImg.getAttribute("src") !== extractState.bgUrl) {
+    elExtractBgImg.src = extractState.bgUrl;
+  }
+  elExtractMarkers.innerHTML = "";
+  if (dims) {
+    extractState.points.forEach((p, k) => {
+      const m = document.createElement("span");
+      m.className = "extract-marker";
+      m.style.left = ((p.x + 0.5) / dims.width) * 100 + "%";
+      m.style.top = ((p.y + 0.5) / dims.height) * 100 + "%";
+      m.textContent = String(k + 1);
+      m.title = `取点 ${k + 1}：(${p.x}, ${p.y})，再次点击该位置可取消`;
+      elExtractMarkers.appendChild(m);
+    });
+  }
+  const n = extractState.points.length;
+  if (!dims) {
+    elExtractPoints.textContent = "";
+  } else if (n === 0) {
+    elExtractPoints.textContent = "尚未取点：在背景图上点击 1～4 个互异位置（坐标按原图像素计）";
+  } else {
+    const pts = extractState.points.map((p, k) => `${k + 1}. (${p.x}, ${p.y})`).join("　");
+    elExtractPoints.textContent =
+      `已选 ${n} 个取点（零基坐标，左上角原点）：${pts}` +
+      (n >= MAX_PICK_POINTS ? "；已达 4 个上限，点击已选位置可取消" : "");
+  }
+}
+
+function renderExtractResult() {
+  const r = extractState.result;
+  if (!r) {
+    elExtractResult.innerHTML = extractState.lastAppendNote
+      ? `<div class="applied-note">${escapeHtml(extractState.lastAppendNote)}</div>`
+      : "";
+    return;
+  }
+  const fresh = extractResultFresh();
+  const pairs = r.pairs || [];
+  const rows = pairs
+    .map(
+      (p, k) => `
+        <div class="extract-pair-row">
+          <span class="row-index">${k + 1}</span>
+          <span class="extract-coord">(${p.x}, ${p.y})</span>
+          <span class="mini" style="background:${p.background}"></span>
+          <span class="hexval">${p.background}</span>
+          <span class="compare-arrow">→</span>
+          <span class="mini" style="background:${p.target}"></span>
+          <span class="hexval">${p.target}</span>
+        </div>`
+    )
+    .join("");
+  const total = state.samples.length + pairs.length;
+  const fits = total <= MAX_SAMPLES;
+  let appendRow;
+  if (!fits) {
+    // 追加后超过 4 组：整批拒绝，样本不被改动
+    appendRow = `
+      <div class="review-incompat">
+        当前已有 ${state.samples.length} 组样本，整批追加 ${pairs.length} 组后共 ${total} 组，
+        超过 ${MAX_SAMPLES} 组上限——整批拒绝，样本未改动。请先减少现有样本或减少取点数量后重新提取。
+      </div>`;
+  } else {
+    appendRow = `
+      <div class="review-append-row">
+        <button class="btn btn-small" data-act="extract-append" type="button"
+                ${fresh ? "" : "disabled"}>确认追加 ${pairs.length} 组样本并重新求解</button>
+        <span class="hint">当前 ${state.samples.length} 组样本，追加后共 ${total} 组（上限 ${MAX_SAMPLES} 组）；
+          同批仅能追加一次，取点或样本变化后需重新提取</span>
+      </div>`;
+  }
+  elExtractResult.innerHTML = `
+    ${fresh ? "" : '<div class="stale-note">取点或样本已变化，以下候选颜色对已失效（不能再追加），请重新提取。</div>'}
+    <div class="suggest-sec-title">候选颜色对（两图对应像素的原始 RGB，不插值、不合成；确认后整批追加为样本）：</div>
+    <div class="rows">${rows}</div>
+    ${appendRow}`;
+}
+
+async function selectExtractFile(kind, file) {
+  // 换图（含清空选择）立即清空取点和候选：纪元 +1（只增不减），在途提取作废并
+  // 结束加载态——不等待图片解码完成；旧候选 / 在途结果即使改回同一张图也不恢复。
+  extractState.epoch += 1;
+  extractState.points = [];
+  extractState.result = null;
+  extractState.resultKey = "";
+  extractState.lastAppendNote = "";
+  extractState.serverErrors = [];
+  if (extractState.inflightId !== 0) {
+    extractState.inflightId = 0;
+    extractState.inflightSig = "";
+    elExtractStatus.textContent = "";
+    elExtractStatus.className = "status";
+  }
+  const slot = kind === "bg" ? "bg" : "me";
+  const label = slot === "bg" ? "背景图" : "实测图";
+  const seq = ++extractState.selectSeq[slot];
+  if (slot === "bg") {
+    extractState.bgFile = null;
+    extractState.bgDims = null;
+    extractState.bgError = "";
+    if (extractState.bgUrl) {
+      URL.revokeObjectURL(extractState.bgUrl);
+      extractState.bgUrl = "";
+    }
+    elExtractBgHint.textContent = "";
+  } else {
+    extractState.meFile = null;
+    extractState.meDims = null;
+    extractState.meError = "";
+    elExtractMeHint.textContent = "";
+  }
+  refreshExtractErrors();
+  renderExtractPoints();
+  renderExtractResult();
+  updateExtractRunBtn();
+  if (!file) return;
+
+  // 客户端预检：扩展名 / MIME、体积；再用浏览器解码确认可解码与尺寸
+  // （RGB 模式无法在前端区分，由服务端严格校验并明确报错）。
+  const errs = [];
+  const nameOk = /\.png$/i.test(file.name) || file.type === "image/png";
+  if (!nameOk) errs.push(`${label}必须是 PNG 格式（不接受 JPEG / GIF / WebP 等）`);
+  if (file.size > 2 * 1024 * 1024) {
+    errs.push(`${label}体积 ${file.size} 字节超出 2 MiB（2097152 字节）上限`);
+  }
+  let dims = null;
+  if (nameOk && file.size <= 2 * 1024 * 1024) {
+    try {
+      dims = await probeImage(file);
+    } catch (msg) {
+      errs.push(String(msg).replace(/^图片/, label));
+    }
+  }
+  // 解码期间同一槽位又换了图：本次选择整体作废，不得覆盖较新状态
+  if (extractState.selectSeq[slot] !== seq) return;
+  if (dims && (dims.width > 512 || dims.height > 512)) {
+    errs.push(`${label}尺寸 ${dims.width}×${dims.height} 超出上限：宽、高均不得超过 512 像素（不会缩放）`);
+  }
+  if (errs.length) {
+    if (slot === "bg") extractState.bgError = errs.join("；");
+    else extractState.meError = errs.join("；");
+    refreshExtractErrors();
+    updateExtractRunBtn();
+    return;
+  }
+  if (slot === "bg") {
+    extractState.bgFile = file;
+    extractState.bgDims = dims;
+    extractState.bgUrl = URL.createObjectURL(file);
+    elExtractBgHint.textContent = `${file.name} · ${dims.width}×${dims.height} · ${file.size} 字节`;
+  } else {
+    extractState.meFile = file;
+    extractState.meDims = dims;
+    elExtractMeHint.textContent = `${file.name} · ${dims.width}×${dims.height} · ${file.size} 字节`;
+  }
+  refreshExtractErrors(); // 两图尺寸一致性预检（最终以服务端判定为准）
+  renderExtractPoints();
+  updateExtractRunBtn();
+}
+
+elExtractBgFile.addEventListener("change", () => {
+  const file = elExtractBgFile.files && elExtractBgFile.files[0] ? elExtractBgFile.files[0] : null;
+  void selectExtractFile("bg", file);
+});
+elExtractMeFile.addEventListener("change", () => {
+  const file = elExtractMeFile.files && elExtractMeFile.files[0] ? elExtractMeFile.files[0] : null;
+  void selectExtractFile("me", file);
+});
+
+// 在背景图上点选 / 取消取点：缩放显示按显示比例换算回原图零基像素坐标
+elExtractPickArea.addEventListener("click", (e) => {
+  const dims = extractState.bgDims;
+  if (!dims) return;
+  const rect = elExtractBgImg.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const fx = (e.clientX - rect.left) / rect.width;
+  const fy = (e.clientY - rect.top) / rect.height;
+  if (fx < 0 || fy < 0 || fx >= 1 || fy >= 1) return;
+  const x = Math.min(dims.width - 1, Math.floor(fx * dims.width));
+  const y = Math.min(dims.height - 1, Math.floor(fy * dims.height));
+  toggleExtractPoint(x, y);
+});
+
+function toggleExtractPoint(x, y) {
+  const pts = extractState.points;
+  const idx = pts.findIndex((p) => p.x === x && p.y === y);
+  if (idx >= 0) {
+    pts.splice(idx, 1);
+  } else if (pts.length < MAX_PICK_POINTS) {
+    pts.push({ x, y });
+  } else {
+    return; // 已达 4 个上限：忽略本次点击（提示见取点行）
+  }
+  extractState.epoch += 1; // 取点变化：旧候选与在途结果立即失效
+  extractState.serverErrors = []; // 上一次提取的服务端报错随取点变化一并清除
+  refreshExtractErrors();
+  markExtractStaleness();
+  renderExtractPoints();
+}
+
+function clearExtractPoints() {
+  if (!extractState.points.length) return;
+  extractState.points = [];
+  extractState.epoch += 1; // 取点变化：旧候选与在途结果立即失效
+  extractState.serverErrors = [];
+  refreshExtractErrors();
+  markExtractStaleness();
+  renderExtractPoints();
+}
+
+// 响应守卫：只有「当前在途请求」且「发出后图片 / 取点 / 样本未再变化」的响应
+// 可以落地；响应体读完之后再次判定，读取窗口内的变化同样作数。
+function extractResponseCurrent(reqId, reqSig) {
+  return (
+    extractState.inflightId === reqId &&
+    extractState.inflightSig === reqSig &&
+    extractSignature() === reqSig
+  );
+}
+
+async function runExtract() {
+  // 直接调用也不得发送请求：两图就绪、1～4 个取点、无在途提取三者缺一不可
+  if (!extractImagesReady()) return;
+  const n = extractState.points.length;
+  if (n < 1 || n > MAX_PICK_POINTS || extractState.inflightId !== 0) return;
+
+  const reqId = ++extractState.reqSeq;
+  extractState.inflightId = reqId;
+  const reqSig = extractSignature();
+  extractState.inflightSig = reqSig;
+  extractState.serverErrors = [];
+  refreshExtractErrors();
+  elExtractStatus.textContent = "提取中…";
+  elExtractStatus.className = "status busy";
+  updateExtractRunBtn();
+
+  const fd = new FormData();
+  fd.append("points", JSON.stringify(extractState.points));
+  fd.append("background", extractState.bgFile);
+  fd.append("measured", extractState.meFile);
+
+  try {
+    const resp = await fetch("/api/extract-samples", { method: "POST", body: fd });
+    if (!extractResponseCurrent(reqId, reqSig)) return; // 上传期间已有变化 / 更新请求
+    const data = await resp.json(); // 响应体读取窗口：读完后再过一次守卫
+    if (!extractResponseCurrent(reqId, reqSig)) return;
+    extractState.inflightId = 0;
+    extractState.inflightSig = "";
+    elExtractStatus.textContent = "";
+    elExtractStatus.className = "status";
+    if (!resp.ok) {
+      extractState.serverErrors = data.errors || [{ scope: "form", message: "提取失败" }];
+      refreshExtractErrors();
+      updateExtractRunBtn();
+      return;
+    }
+    extractState.result = data;
+    extractState.resultKey = reqSig;
+    extractState.lastAppendNote = "";
+    renderExtractResult();
+    updateExtractRunBtn();
+  } catch (err) {
+    if (!extractResponseCurrent(reqId, reqSig)) return;
+    extractState.inflightId = 0;
+    extractState.inflightSig = "";
+    elExtractStatus.textContent = "";
+    elExtractStatus.className = "status";
+    extractState.serverErrors = [{ scope: "form", message: "无法连接提取服务：" + err.message }];
+    refreshExtractErrors();
+    updateExtractRunBtn();
+  }
+}
+
+function appendExtractedSamples() {
+  const r = extractState.result;
+  // 追加前再次核对资格：候选已失效（取点 / 样本曾变化）时不改任何样本
+  if (!r || !extractResultFresh()) return;
+  const pairs = Array.isArray(r.pairs) ? r.pairs : [];
+  if (!pairs.length) return;
+  // 追加后超过 4 组上限：整批拒绝，样本不被改动
+  if (state.samples.length + pairs.length > MAX_SAMPLES) return;
+  pairs.forEach((p) => {
+    state.samples.push({ background: p.background, target: p.target });
+  });
+  // 同批仅能追加一次：清空候选，仅保留一条已追加提示
+  extractState.result = null;
+  extractState.resultKey = "";
+  extractState.lastAppendNote =
+    `已把 ${pairs.length} 组颜色对整批追加为样本并触发重新求解；同批不能重复追加，可重新取点提取。`;
+  renderExtractResult();
+  // 成功追加沿用输入变更流程：旧计算与调序执行失效（已确认记录保留）、重新求解
+  render();
+  noteSolveInputChanged();
+  markCycleStaleness();
+  markInferStaleness();
+  markSuggestStaleness();
+  renderSuggestControls();
+  markReviewStaleness();
+  markTransitionStaleness();
+  runSolve();
+}
 
 // ------------------------------------------------------------ 启动 --
 render();
 renderSuggestControls();
 renderReviewBgOptions();
+renderExtractPoints();
+updateExtractRunBtn();
 runSolve();

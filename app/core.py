@@ -16,6 +16,8 @@
 - 过渡步骤规划：给出当前实际底→顶叠序与非负有限的过渡总误差上限，在
   「满足先后关系且旧样本总误差不超过上限」的状态图上，以相邻交换为边做 BFS，
   求交换次数最少的完整路径；并列时按每步交换前两层 ID 对序列的字典序决胜
+- 图片取点坐标解析：1～4 个互异的零基整数坐标（左上角为原点），供从背景图
+  与叠层实测图的对应像素提取校准样本使用
 """
 
 from __future__ import annotations
@@ -41,6 +43,8 @@ MIN_CANDIDATES = 2
 MAX_CANDIDATES = 12
 MAX_SUGGEST_ORDERS = 12
 MAX_REVIEW_ORDERS = 12
+MIN_PICK_POINTS = 1
+MAX_PICK_POINTS = 4
 
 class CalibrationError(Exception):
     """输入校验失败，errors 为可直接展示给用户的中文错误列表。"""
@@ -329,6 +333,73 @@ def _raise_if_cycle(parsed: _Parsed) -> None:
         raise CalibrationError(
             [_err("relations", f"图层先后关系成环，存在冲突：{chain}（底 → 顶方向不能绕回自身）")]
         )
+
+
+# --------------------------------------------------------- 图片取点（共用） --
+
+
+def parse_pick_points(
+    raw_points: Any, width: int | None = None, height: int | None = None
+) -> tuple[list[tuple[int, int]], list[dict[str, Any]]]:
+    """解析图片取点坐标：1～4 个互异的零基整数坐标（左上角为原点）。
+
+    width / height 给出时校验越界（0 ≤ x < width，0 ≤ y < height）；为 None
+    时仅做结构与重复性检查（图片本身非法、无法判定边界的情形，此时调用方
+    必然已有图片错误，本函数的结构性错误一并收集展示）。
+    返回 (按提交顺序的 (x, y) 列表, 中文错误列表)。
+    """
+    if not isinstance(raw_points, list):
+        return [], [_err("points", "缺少 points 列表或其格式不正确：应为 1～4 个取点坐标")]
+
+    errors: list[dict[str, Any]] = []
+    if not (MIN_PICK_POINTS <= len(raw_points) <= MAX_PICK_POINTS):
+        errors.append(
+            _err(
+                "points",
+                f"取点数量必须在 {MIN_PICK_POINTS}～{MAX_PICK_POINTS} 个之间，当前 {len(raw_points)} 个",
+            )
+        )
+
+    points: list[tuple[int, int]] = []
+    seen: dict[tuple[int, int], int] = {}
+    for i, item in enumerate(raw_points[:MAX_PICK_POINTS]):
+        if not isinstance(item, dict):
+            errors.append(_err("points", "取点坐标格式不正确，应为含 x、y 的对象", i))
+            continue
+        x, y = item.get("x"), item.get("y")
+        if (
+            isinstance(x, bool)
+            or not isinstance(x, int)
+            or isinstance(y, bool)
+            or not isinstance(y, int)
+        ):
+            errors.append(
+                _err(
+                    "points",
+                    f"取点坐标必须是零基整数（左上角为原点），实际为 x={x!r}、y={y!r}",
+                    i,
+                )
+            )
+            continue
+        if width is not None and height is not None and not (0 <= x < width and 0 <= y < height):
+            errors.append(
+                _err(
+                    "points",
+                    f"取点坐标越界：({x}, {y}) 超出图片范围（宽 {width}、高 {height}，"
+                    f"零基坐标 x 取 0～{width - 1}、y 取 0～{height - 1}）",
+                    i,
+                )
+            )
+            continue
+        key = (x, y)
+        if key in seen:
+            errors.append(
+                _err("points", f"取点坐标重复：({x}, {y}) 与第 {seen[key] + 1} 个取点相同", i)
+            )
+            continue
+        seen[key] = i
+        points.append(key)
+    return points, errors
 
 
 # ------------------------------------------------------- 成环解除方案 --

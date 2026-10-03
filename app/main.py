@@ -21,6 +21,7 @@ from .core import (
     solve,
     suggest_background,
 )
+from .extract import extract_sample_pairs
 app = FastAPI(title="透明图层叠序校准台", version="1.7.0")
 
 
@@ -188,6 +189,69 @@ async def api_composite_preview(request: Request) -> Response:
         "X-Composite-Height": str(height),
     }
     return Response(content=png, media_type="image/png", headers=headers)
+
+
+@app.post("/api/extract-samples")
+async def api_extract_samples(request: Request) -> JSONResponse:
+    """接收背景图（multipart 字段 background）、叠层实测图（字段 measured）与
+    取点坐标（字段 points，JSON 数组文本，元素为 {"x": 零基整数, "y": 零基整数}，
+    左上角为原点，1～4 个互异位置），按提交顺序返回每个取点的坐标及两图原始
+    RGB 对应的背景 / 目标 HEX。不插值、不合成、不改动任何校准输入；
+    任何校验失败均为 400 JSON。"""
+    # 与 /api/composite-preview 相同：放宽单 part 上限到 2 MiB + 1 字节，
+    # 超限仍由下方逻辑明确报错；旧版 Starlette 回退到默认调用。
+    try:
+        try:
+            form = await request.form(max_part_size=MAX_IMAGE_BYTES + 1)
+        except TypeError:
+            form = await request.form()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"errors": [{"scope": "form", "message": "请求必须是 multipart/form-data 表单（含 points、background 与 measured 字段），或图片体积超过 2 MiB 上限"}]},
+        )
+
+    errors: list[dict[str, Any]] = []
+    images: dict[str, bytes] = {}
+    for field, scope, label in (
+        ("background", "background", "背景图"),
+        ("measured", "measured", "实测图"),
+    ):
+        upload = form.get(field)
+        if upload is None or not hasattr(upload, "read"):
+            errors.append(
+                {"scope": scope, "message": f"缺少{label}文件：请通过 multipart 表单字段 {field} 上传一张 PNG 图片"}
+            )
+            continue
+        # 多读一个字节用于区分「正好 2 MiB」与「超过 2 MiB」，超限文件不全量读入内存
+        data = await upload.read(MAX_IMAGE_BYTES + 1)
+        if len(data) > MAX_IMAGE_BYTES:
+            errors.append(
+                {"scope": scope, "message": f"{label}体积超出 2 MiB（{MAX_IMAGE_BYTES} 字节）上限，请压缩或裁剪后重试"}
+            )
+            continue
+        images[field] = data
+
+    raw_points: Any = None
+    points_field = form.get("points")
+    if not isinstance(points_field, str) or not points_field.strip():
+        errors.append(
+            {"scope": "points", "message": '缺少 points 表单字段：应为 1～4 个取点坐标的 JSON 数组文本（如 [{"x":0,"y":0}]，左上角为原点）'}
+        )
+    else:
+        try:
+            raw_points = json.loads(points_field)
+        except json.JSONDecodeError:
+            errors.append({"scope": "points", "message": "points 字段不是合法的 JSON"})
+
+    if errors:
+        return JSONResponse(status_code=400, content={"errors": errors})
+
+    try:
+        result = extract_sample_pairs(images["background"], images["measured"], raw_points)
+    except CalibrationError as exc:
+        return JSONResponse(status_code=400, content={"errors": exc.errors})
+    return JSONResponse(status_code=200, content=result)
 
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
